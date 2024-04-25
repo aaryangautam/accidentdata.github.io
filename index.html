@@ -1,0 +1,262 @@
+<html>
+
+<head>
+    <script src='https://api.tiles.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js'></script>
+    <link href='https://api.tiles.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.css' rel='stylesheet' />
+    <script src='https://unpkg.com/@turf/turf/turf.min.js'></script>
+    <style>
+        body {
+            margin: 0;
+        }
+
+        #map {
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <script>
+        const MBAT = ['pk.eyJ1IjoiYWFyeWFuZ2F1dGFtIiwiYSI6ImNsdmVyamhzcjA2MzQya252bWF0azhlYjMifQ.MGJiLg-NAUhZu2weRezG8w'];
+        const MET_OFFICE_DATA_POINT_API_KEY = ['ab4da8c3-686d-450f-b0c0-98faf0dac8f2'];
+        const linesArr = [] // We will use this to store our lines later
+        const windDirections = {
+            S: 0,
+            SSW: 22.5,
+            SW: 45,
+            WSW: 67.5,
+            W: 90,
+            WNW: 112.5,
+            NW: 135,
+            NNW: 157.5,
+            N: 180,
+            NNE: -157.5,
+            NE: -135,
+            ENE: -112.5,
+            E: -90,
+            ESE: -67.5,
+            SE: -45,
+            SSE: -22.5
+        }
+        mapboxgl.accessToken = MBAT;
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/dark-v10',
+            center: [-2.3204513181824584, 53.80543669141514],
+            zoom: 4,
+        });
+
+        map.on('load', async () => {
+            map.addSource('windData', { // WIND LINES
+                'type': 'geojson',
+                'data': {
+                    "type": "FeatureCollection",
+                    "features": await getData()
+                }
+            });
+
+            map.addLayer({ // ANIMATED WIND
+                'id': 'wind',
+                'type': 'line',
+                'source': 'windData',
+                'layout': {
+                    'line-join': 'round',
+                    'line-cap': 'square'
+                },
+                'paint': {
+                    'line-color': 'white',
+                    'line-width': ['get', 'windSpeedWidth'], // We'll use this later to show how strong the wind is
+                    'line-blur': ['get', 'blur'] // We'll use this as part of the animation
+                }
+            });
+
+            animateLine();
+
+        })
+
+        function getData() {
+            return new Promise(function (resolve, reject) {
+                fetch('http://datapoint.metoffice.gov.uk/public/data/val/wxobs/all/json/all?res=hourly&key=' + MET_OFFICE_DATA_POINT_API_KEY, {
+                    method: 'get'
+                }).then(response => response.json()).then(d => {
+                    const weatherPoints = [];
+                    if (d.SiteRep && d.SiteRep.DV && d.SiteRep.DV.Location) { // Check the data actually exists
+                        for (var l of d.SiteRep.DV.Location) {
+                            if (!l.lat || !l.lon || !l.Period || !Array.isArray(l.Period)) continue; // Check we have a lat and a long for the station so we can plot it on a map
+                            var tPoint = turf.point([l.lon * 1, l.lat * 1], { name: l.name });
+                            // Get the last day we have data for (which will be today)
+                            var tDay = l.Period[l.Period.length - 1];
+                            // Get the last hour we have data for (which will be the start of the current hour)
+                            var tHour = tDay.Rep[tDay.Rep.length - 1];
+                            // Now get the wind direction - called D in the object
+                            var tDirection = windDirections[tHour.D];
+                            if (tDirection && tHour.S) {
+                                tPoint.properties = {
+                                    windDirection: tDirection,
+                                    windSpeed: tHour.S,
+                                    windSpeedWidth: tHour.S / 5 // Change 5 to another number to make the lines wider or thinner
+                                }
+                                weatherPoints.push(tPoint)
+                            }
+                        }
+                    }
+
+                    // We space the points we create 20 miles apart. You can change that to suit your needs - the smaller the number the more lines you get.
+                    // Interpolate wind speed
+                    var speedGrid = turf.interpolate(turf.featureCollection(weatherPoints), 20, { gridType: 'points', property: 'windSpeed', units: 'miles' });
+                    // Interpolate wind direction
+                    var directionGrid = turf.interpolate(turf.featureCollection(weatherPoints), 20, { gridType: 'points', property: 'windDirection', units: 'miles' });
+                    // Now we have to join them back up again so we have a set of points that have both a speed and a direction.
+                    for (var sf of speedGrid.features) {
+                        var tdf = directionGrid.features.find(df => df.geometry.coordinates[0] == sf.geometry.coordinates[0] && df.geometry.coordinates[1] == sf.geometry.coordinates[1]);
+                        tdf.properties.windSpeed = sf.properties.windSpeed;
+                        tdf.properties.windSpeedWidth = sf.properties.windSpeed / 5;
+                        tdf.properties.blur = 0; // We will use this as part of the animation later
+                    }
+
+                    for (var df of directionGrid.features.filter(f => f.properties.windDirection)) {
+                        var tDest = turf.destination(df, Math.floor(Math.random() * (150 - 20 + 1) + 20), df.properties.windDirection);
+                        var tCoords = turf.coordAll(turf.lineChunk(turf.lineString([df.geometry.coordinates, tDest.geometry.coordinates]), getWindSpeedDistace(df.properties.windSpeed)));
+                        var coordArr = Array.from(new Set(tCoords.map(JSON.stringify)), JSON.parse);
+                        linesArr.push({
+                            animationCounter: 0,
+                            showMe: Math.random() > 0.65,
+                            lineCoordinates: coordArr,
+                            windSpeed: df.properties.windSpeed,
+                            lineString: {
+                                "type": "Feature",
+                                "properties": df.properties,
+                                "geometry": {
+                                    "type": "LineString",
+                                    "coordinates": []
+                                }
+                            }
+                        })
+                    }
+                    return resolve([]);
+                })
+            })
+        }
+
+        // Animate the wind lines.
+        function animateLine() {
+            // Create an array of lines we will actually show on the map
+            var geojson = [];
+            for (var l of linesArr) {
+                // If the line is alredy being drawn or if this is the first time animating the lines.
+                // The randomness is important to stop all the line showing at the same time at the same framerate on load which looks weird.
+                if (l.lineString.geometry.coordinates.length > 0 || Math.random() > 0.85) { // change 0.85 to make it more or less likely to show it
+                    if (l.animationCounter < l.lineCoordinates.length) { // The line is getting longer
+                        l.lineString.properties.blur += 0.05
+                        l.lineString.geometry.coordinates.push(l.lineCoordinates[l.animationCounter]);
+                        if (l.animationCounter > 80) l.lineString.geometry.coordinates.shift() // Cut the tail off it to make the animation a bit smoother
+                        l.animationCounter++;
+                    } else { // The line is getting shorter
+                        l.lineString.properties.blur += 0.5
+                        var coord = l.lineString.geometry.coordinates;
+                        coord.shift();
+                        if (coord.length > 0) {
+                            l.lineString.geometry.coordinates = coord
+                        } else { // The line has finished its cycle. Reset the blur and counter
+                            l.lineString.properties.blur = 0;
+                            l.animationCounter = 0;
+                            l.showMe = l.lineString.properties.alwaysOn || Math.random() > 0.7; // Decide whether we are going to show the line or not next time it draws
+                        }
+                    }
+                }
+            }
+
+            // Update the wind lines source with the showable lines
+            map.getSource('windData').setData({
+                "type": "FeatureCollection",
+                "features": linesArr.filter(l => l.showMe).map(l => l.lineString)
+            });
+            requestAnimationFrame(animateLine);
+        }
+
+        function getWindSpeedDistace(windSpeed) {
+            var speeds = [
+                { speed: 100, distance: 1 },
+                { speed: 90, distance: 0.9 },
+                { speed: 80, distance: 0.8 },
+                { speed: 70, distance: 0.7 },
+                { speed: 60, distance: 0.6 },
+                { speed: 50, distance: 0.5 },
+                { speed: 40, distance: 0.4 },
+                { speed: 30, distance: 0.3 },
+                { speed: 20, distance: 0.2 },
+                { speed: 10, distance: 0.1 },
+            ];
+            var dist = speeds.reduce(function (prev, curr) {
+                return (Math.abs(curr.speed - windSpeed) < Math.abs(prev.speed - windSpeed) ? curr : prev);
+            });
+
+            return dist.distance;
+        }
+    </script>
+</body>
+
+</html>
+
+<!-- <html>
+
+<head>
+    <script src='https://api.tiles.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js'></script>
+    <link href='https://api.tiles.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.css' rel='stylesheet' />
+    <script src='https://unpkg.com/@turf/turf/turf.min.js'></script>
+    <style>
+        body {
+            margin: 0;
+        }
+        #map {
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <script>
+         const MBAT = ['pk.eyJ1IjoiYWFyeWFuZ2F1dGFtIiwiYSI6ImNsdmVyamhzcjA2MzQya252bWF0azhlYjMifQ.MGJiLg-NAUhZu2weRezG8w'];
+        const MET_OFFICE_DATA_POINT_API_KEY = ['ab4da8c3-686d-450f-b0c0-98faf0dac8f2'];
+        const linesArr = [] // We will use this to store our lines later
+        mapboxgl.accessToken = MBAT;
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/dark-v10',
+            center: [-2.3204513181824584, 53.80543669141514],
+            zoom: 4,
+        });
+
+        map.on('load', async () => {
+            map.addSource('windData', { // WIND LINES
+                'type': 'geojson',
+                'data': {
+                    "type": "FeatureCollection",
+                    "features": []
+                }
+            });
+
+            map.addLayer({ // ANIMATED WIND
+                'id': 'wind',
+                'type': 'line',
+                'source': 'windData',
+                'layout': {
+                    'line-join': 'round',
+                    'line-cap': 'square'
+                },
+                'paint': {
+                    'line-color': 'white',
+                    'line-width': ['get', 'windSpeedWidth'], // We'll use this later to show how strong the wind is
+                    'line-blur': ['get', 'blur'] // We'll use this as part of the animation
+                }
+            });
+        });
+
+    </script>
+</body>
+
+</html> -->
